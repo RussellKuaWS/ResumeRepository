@@ -1,0 +1,232 @@
+---
+title: "Machine Learning Demo - Predictive Model"
+output: 
+  flexdashboard::flex_dashboard:
+    theme: spacelab
+    vertical_layout: fill
+    orientation: columns
+runtime: shiny
+---
+
+
+```{r setup, include=FALSE}
+library(flexdashboard)
+library(shiny)
+library(DT)
+library(dplyr)
+library(plotly)
+library(readr)
+library(tidyverse)
+library(caret)
+library(xgboost)
+library(ROCR)
+library(ggplot2)
+
+qdata <- read_csv("QOL_caregivers.csv")
+
+#str(qdata)
+
+#For simplicity, the model is demographic agnostic for now, ie., no demographic variables are used 
+cat_dataIndv_x <- qdata %>% 
+  select(2,10:11,13,21:40, 42:46,47:55,57:63) %>% 
+  mutate_all(funs(as.factor)) %>% 
+  mutate(F20_1_Period = as.numeric(F20_1_Period),F21 = as.numeric(F21))
+
+set.seed(1234)
+
+#Since all variables are categorical, they are converted to dummy variables
+dummyvtr <- predict(dummyVars(~., cat_dataIndv_x), cat_dataIndv_x)
+
+#Scaling is done on the variables for clustering
+preProcValues <- preProcess(dummyvtr, method = c("center", "scale"), na.remove=TRUE)
+datTransformed <- data.frame(predict(preProcValues, dummyvtr))
+
+#str(datTransformed)
+
+#cluster the services questions to create labels
+# full kmeans(datTransformed[,c(126:184)]
+k_means_r <- kmeans(datTransformed[,c(135:193)], centers=2,nstart=2)
+
+
+#summary(as.factor(k_means_r$cluster))
+
+#put back the new labels
+newlabels <- k_means_r$cluster
+
+#Recode newlabels to 1 or 0
+datTransformed$labels <-as.factor(ifelse(newlabels==2,0,1))
+
+#head(datTransformed)
+
+
+#Additional EDA
+# datTransformed %>% 
+#   count(labels)
+# 
+# plot(datTransformed$labels)
+# 
+# 
+# #Exploring the well-being of the label 1 cases
+# qdataCheck <- qdata
+# qdataCheck$labels <- datTransformed$labels
+# 
+# EDAdatTransformed <- qdataCheck %>% 
+#   filter(labels==1) %>% 
+#   summarize(meanQoL=mean(WHOQOL.Overall))
+# EDAdatTransformed
+
+#Train-Test Split and selection of QoL question items (with one-hot encoding) and newlabels. 
+#Note: the services-related questions must be excluded
+
+train_idx <- sample(1:nrow(datTransformed), 0.70*nrow(datTransformed))
+train_datacat0 <- datTransformed[train_idx, c(1:134,194)]
+test_datacat0 <- datTransformed[-train_idx, c(1:134,194)]
+
+#double check
+# names(train_datacat0)
+
+#PCA-Transform and Scale Predictors
+preProcValues <- preProcess(train_datacat0, method = c("center", "scale","pca"),pcaComp = 8,na.remove=TRUE)
+
+train_datacat <- predict(preProcValues, train_datacat0)
+test_datacat <- predict(preProcValues, test_datacat0)
+
+#Building a KNN Model 
+trainc <- trainControl(
+  method="cv",
+  number = 15,
+  sampling="up",
+  verboseIter = TRUE)
+
+nrounds <- 1000
+xg_grid <- expand.grid(
+  nrounds = 350
+  ,max_depth=3
+  ,eta=0.010
+  ,gamma=0
+  ,colsample_bytree = 0.6
+  ,min_child_weight=3
+  ,subsample=1
+)
+
+modelcat <- train(labels~., train_datacat
+                  ,method = "xgbTree"
+                  ,trControl = trainc
+                  ,tuneGrid=xg_grid
+)
+
+tuneplotx <- function(x, probs = .90) {
+  ggplot(x) +
+    coord_cartesian(ylim = c(min(x$results$Accuracy),quantile(x$results$Accuracy, probs = probs))) +
+    scale_y_continuous(trans="reverse")+
+     ggtitle("Model Training Accuracy by Boosting Iterations")+
+    theme_bw()
+}
+
+nrounds <- 1000
+xg_grid <- expand.grid(
+  nrounds = seq(from = 50, to = nrounds, by = 50)
+  ,max_depth=3
+  ,eta=0.010
+  ,gamma=0
+  ,colsample_bytree = 0.6
+  ,min_child_weight=3
+  ,subsample=1
+)
+
+modelXXX <- train(labels~., train_datacat
+                  ,method = "xgbTree"
+                  ,trControl = trainc
+                  ,tuneGrid=xg_grid
+)
+
+```
+
+```{r}
+
+# Make predictions on test set
+predictionscat0 <- predict(modelcat, test_datacat)
+
+# Evaluate predictive model using AUC score
+perf_predictionscat0 <- prediction(as.numeric(predictionscat0),as.numeric(test_datacat$labels))
+auc_pred <- performance(perf_predictionscat0,measure="auc")
+
+```
+
+
+Column {.sidebar data-width=200}
+-----------------------------------------------------------------
+
+```{r inputs}
+
+```
+
+
+```{r reactive expression}
+
+```
+
+Column {data-width=400}
+-----------------------------------------------------------------------
+
+###
+
+```{r summary}
+tresult <- modelcat$results
+rownames(tresult) <- c("Values")
+tags$h4("Training Parameters and Results")
+  fluidRow(
+    
+    tableOutput(print(t(tresult)))
+  )
+
+
+```
+
+###
+
+```{r table}
+
+tuneplotx(modelXXX)
+
+
+
+```
+
+Column {data-width=400}
+-----------------------------------------------------------------------
+
+###
+
+```{r scatter}
+datTransformedQ4Q8 <- datTransformed
+datTransformedQ4Q8$Q4_CaseManagement_Counselling <- rowMeans(datTransformedQ4Q8[,150:154])
+datTransformedQ4Q8$Q8_Caregiving_training <-  rowMeans(datTransformedQ4Q8[,165:169])
+Q4_kclustermeans <- rowMeans(k_means_r$centers[,16:20])
+Q8_kclustermeans <- rowMeans(k_means_r$centers[,31:35])
+    ggplot()+
+      geom_jitter(data=datTransformedQ4Q8,
+                 aes(x=Q4_CaseManagement_Counselling, y=Q8_Caregiving_training, color=labels), width=2)+
+      xlim(-1,1.5)+
+      ylim(-0.1,0.75)+
+      geom_point(aes_string(x=Q4_kclustermeans,y=Q8_kclustermeans), color="black", size=8)+
+      geom_text(aes_string(x=Q4_kclustermeans,y=Q8_kclustermeans),label=1:2, color="white", size=6)+
+      ggtitle("Cluster separation between Q4 and Q8")+
+      xlab("Mean scores for Q4 on Case Management and Counselling (scaled)")+
+      ylab("Mean scores for Q8 on Caregiving-related Training (scaled")+
+      theme_bw()
+
+
+```
+
+###
+
+```{r output}
+renderPrint({
+   
+  confusionMatrix(predictionscat0, test_datacat$labels, positive="1")
+  
+})
+
+```
+

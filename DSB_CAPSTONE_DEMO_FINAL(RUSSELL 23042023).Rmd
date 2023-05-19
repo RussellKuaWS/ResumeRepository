@@ -1,0 +1,138 @@
+---
+title: "Bootcamp Demo"
+author: "Kua Wui Sing"
+date: "2023-04-25"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#xgboost with some demo with PCA
+```{r}
+#Predictive Model: Identify potential and/or return users of social services based on QoL scores
+#Practical Application: Screening, planning tool
+
+#Strategy: "Semi-Supervised Learning" 
+#1. Using unsupervised learning to create a binary label using relevant question items on the usage/non-usage of services
+#2. Using supervised learning to classify users as users or non-users
+
+library(readr)
+library(tidyverse)
+library(caret)
+library(xgboost)
+library(ROCR)
+
+qdata <- read_csv("QOL_caregivers.csv")
+
+str(qdata)
+
+#For simplicity, the model is demographic agnostic for now, ie., no demographic variables are used 
+cat_dataIndv_x <- qdata %>% 
+  select(2,10:11,13,21:40, 42:46,47:55,57:63) %>% 
+  mutate_all(funs(as.factor)) %>% 
+  mutate(F20_1_Period = as.numeric(F20_1_Period),F21 = as.numeric(F21))
+
+set.seed(1234)
+
+#Since all variables are categorical, they are converted to dummy variables
+dummyvtr <- predict(dummyVars(~., cat_dataIndv_x), cat_dataIndv_x)
+
+#Scaling is done on the variables for clustering
+preProcValues <- preProcess(dummyvtr, method = c("center", "scale"))
+datTransformed <- data.frame(predict(preProcValues, dummyvtr))
+
+str(datTransformed)
+
+#cluster the services questions to create labels
+# full kmeans(datTransformed[,c(126:184)]
+k_means_r <- kmeans(datTransformed[,c(135:193)], centers=2,nstart=2)
+
+
+summary(as.factor(k_means_r$cluster))
+
+#put back the new labels
+newlabels <- k_means_r$cluster
+
+#Recode newlabels to 1 or 0
+datTransformed$labels <-as.factor(ifelse(newlabels==2,0,1))
+
+head(datTransformed)
+
+
+#Additional EDA
+datTransformed %>% 
+  count(labels)
+
+plot(datTransformed$labels)
+
+
+#Exploring the well-being of the label 1 cases
+qdataCheck <- qdata
+qdataCheck$labels <- datTransformed$labels
+
+EDAdatTransformed <- qdataCheck %>% 
+  filter(labels==1) %>% 
+  summarize(meanQoL=mean(WHOQOL.Overall))
+EDAdatTransformed
+
+#Train-Test Split and selection of QoL question items (with one-hot encoding) and newlabels. 
+#Note: the services-related questions must be excluded
+
+train_idx <- sample(1:nrow(datTransformed), 0.70*nrow(datTransformed))
+train_datacat0 <- datTransformed[train_idx, c(1:134,194)]
+test_datacat0 <- datTransformed[-train_idx, c(1:134,194)]
+
+#double check
+names(train_datacat0)
+
+#PCA-Transform and Scale Predictors
+preProcValues <- preProcess(train_datacat0, method = c("BoxCox","center", "scale","pca"),pcaComp = 8)
+
+train_datacat <- predict(preProcValues, train_datacat0)
+test_datacat <- predict(preProcValues, test_datacat0)
+
+#Building a KNN Model 
+trainc <- trainControl(
+  method="repeatedcv",
+  number = 15,
+  sampling="up",
+  verboseIter = TRUE)
+
+xg_grid <- expand.grid(
+  nrounds = 350
+  ,max_depth=3
+  ,eta=0.01
+  ,gamma=0
+  ,colsample_bytree = 0.6
+  ,min_child_weight=3
+  ,subsample=1
+)
+
+modelcat <- train(labels~., train_datacat
+                  ,method = "xgbTree"
+                  ,trControl = trainc
+                  ,tuneGrid=xg_grid
+                  ,verbose=TRUE
+)
+
+modelcat
+varImp(modelcat)
+#plot(modelcat)
+
+# Make predictions on test set
+predictionscat0 <- predict(modelcat, test_datacat)
+
+confusionMatrix(predictionscat0, test_datacat$labels, positive="1")
+
+# Evaluate predictive model using AUC score
+perf_predictionscat0 <- prediction(as.numeric(predictionscat0),as.numeric(test_datacat$labels))
+auc_pred <- performance(perf_predictionscat0,measure="auc")
+auc_pred@y.values
+auc_predxy <- performance(perf_predictionscat0,measure="tpr", x.measure="fpr")
+plot(auc_predxy,main="ROC Curve", col="blue", lwd=3)
+abline(a=0,b=1,lwd=3,lty=2,col=1)
+
+
+```
